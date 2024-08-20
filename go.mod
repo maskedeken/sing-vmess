@@ -15,5 +15,6 @@ require (
 	github.com/cloudflare/circl v1.3.6 // indirect
 	github.com/gaukas/godicttls v0.0.4 // indirect
 	github.com/klauspost/compress v1.17.4 // indirect
+	github.com/sagernet/cloudflare-tls v0.0.0-20231208171750-a4483c1b7cd1 // indirect
 	golang.org/x/sys v0.21.0 // indirect
 )
