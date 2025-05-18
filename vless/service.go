@@ -6,7 +6,7 @@ import (
 	"io"
 	"net"
 
-	"github.com/sagernet/sing-vmess"
+	vmess "github.com/sagernet/sing-vmess"
 	"github.com/sagernet/sing/common/auth"
 	"github.com/sagernet/sing/common/buf"
 	"github.com/sagernet/sing/common/bufio"
@@ -23,16 +23,15 @@ type Service[T comparable] struct {
 	userFlow        map[T]string
 	logger          logger.Logger
 	handler         Handler
-	fallbackHandler N.TCPConnectionHandler
+	fallbackHandler N.TCPConnectionHandlerEx
 }
 
 type Handler interface {
-	N.TCPConnectionHandler
-	N.UDPConnectionHandler
-	E.Handler
+	N.TCPConnectionHandlerEx
+	N.UDPConnectionHandlerEx
 }
 
-func NewService[T comparable](logger logger.Logger, handler Handler, fallbackHandler N.TCPConnectionHandler) *Service[T] {
+func NewService[T comparable](logger logger.Logger, handler Handler, fallbackHandler N.TCPConnectionHandlerEx) *Service[T] {
 	return &Service[T]{
 		logger:          logger,
 		handler:         handler,
@@ -55,9 +54,7 @@ func (s *Service[T]) UpdateUsers(userList []T, userUUIDList []string, userFlowLi
 	s.userFlow = userFlowMap
 }
 
-var _ N.TCPConnectionHandler = (*Service[int])(nil)
-
-func (s *Service[T]) NewConnection(ctx context.Context, conn net.Conn, metadata M.Metadata) error {
+func (s *Service[T]) NewConnection(ctx context.Context, conn net.Conn, source M.Socksaddr, onClose N.CloseHandlerFunc) error {
 	buffer := buf.NewSize(8192)
 	defer buffer.Release()
 
@@ -67,20 +64,18 @@ func (s *Service[T]) NewConnection(ctx context.Context, conn net.Conn, metadata 
 	}
 	header := buffer.Bytes()
 	if firstLen < 18 {
-		return s.fallback(ctx, conn, metadata, header, E.New("bad request size"))
+		return s.fallback(ctx, conn, source, header, E.New("bad request size"), onClose)
 	}
 
 	request, err := ReadRequest(buffer)
 	if err != nil {
-		return s.fallback(ctx, conn, metadata, header, err)
+		return s.fallback(ctx, conn, source, header, err, onClose)
 	}
 	user, loaded := s.userMap[request.UUID]
 	if !loaded {
-		return s.fallback(ctx, conn, metadata, header, E.New("unknown UUID: ", uuid.FromBytesOrNil(request.UUID[:])))
+		return s.fallback(ctx, conn, source, header, E.New("unknown UUID: ", uuid.FromBytesOrNil(request.UUID[:])), onClose)
 	}
 	ctx = auth.ContextWithUser(ctx, user)
-	metadata.Destination = request.Destination
-
 	userFlow := s.userFlow[user]
 	if request.Flow == FlowVision && request.Command == vmess.NetworkUDP {
 		return E.New(FlowVision, " flow does not support UDP")
@@ -93,7 +88,8 @@ func (s *Service[T]) NewConnection(ctx context.Context, conn net.Conn, metadata 
 	}
 
 	if request.Command == vmess.CommandUDP {
-		return s.handler.NewPacketConnection(ctx, &serverPacketConn{ExtendedConn: bufio.NewExtendedConn(conn), destination: request.Destination}, metadata)
+		s.handler.NewPacketConnectionEx(ctx, &serverPacketConn{ExtendedConn: bufio.NewExtendedConn(conn), destination: request.Destination}, source, request.Destination, onClose)
+		return nil
 	}
 	responseConn := &serverConn{ExtendedConn: bufio.NewExtendedConn(conn), writer: bufio.NewVectorisedWriter(conn)}
 	switch userFlow {
@@ -109,20 +105,22 @@ func (s *Service[T]) NewConnection(ctx context.Context, conn net.Conn, metadata 
 	}
 	switch request.Command {
 	case vmess.CommandTCP:
-		return s.handler.NewConnection(ctx, conn, metadata)
+		s.handler.NewConnectionEx(ctx, conn, source, request.Destination, onClose)
+		return nil
 	case vmess.CommandMux:
-		return vmess.HandleMuxConnection(ctx, conn, s.handler)
+		return vmess.HandleMuxConnection(ctx, conn, source, s.handler)
 	default:
 		return E.New("unknown command: ", request.Command)
 	}
 }
 
-func (s *Service[T]) fallback(ctx context.Context, conn net.Conn, metadata M.Metadata, header []byte, err error) error {
+func (s *Service[T]) fallback(ctx context.Context, conn net.Conn, source M.Socksaddr, header []byte, err error, onClose N.CloseHandlerFunc) error {
 	if s.fallbackHandler == nil {
 		return E.Extend(err, "fallback disabled")
 	}
 	conn = bufio.NewCachedConn(conn, buf.As(header).ToOwned())
-	return s.fallbackHandler.NewConnection(ctx, conn, metadata)
+	s.fallbackHandler.NewConnectionEx(ctx, conn, source, M.Socksaddr{}, onClose)
+	return nil
 }
 
 func flowName(value string) string {
