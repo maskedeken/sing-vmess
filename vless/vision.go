@@ -59,7 +59,7 @@ type VisionConn struct {
 	remainingPadding       int
 	currentCommand         byte
 	directRead             bool
-	remainingReader        io.Reader
+	remainingBuffers       []*buf.Buffer
 }
 
 func NewVisionConn(conn net.Conn, tlsConn net.Conn, userUUID [16]byte, logger logger.Logger) (*VisionConn, error) {
@@ -106,15 +106,19 @@ func NewVisionConn(conn net.Conn, tlsConn net.Conn, userUUID [16]byte, logger lo
 }
 
 func (c *VisionConn) Read(p []byte) (n int, err error) {
-	if c.remainingReader != nil {
-		n, err = c.remainingReader.Read(p)
-		if err == io.EOF {
-			err = nil
-			c.remainingReader = nil
+	for len(c.remainingBuffers) > 0 {
+		newN, _ := c.remainingBuffers[0].Read(p[n:])
+		if c.remainingBuffers[0].IsEmpty() {
+			c.remainingBuffers[0].Release()
+			c.remainingBuffers = c.remainingBuffers[1:]
 		}
-		if n > 0 {
-			return
+		n += newN
+		if n == len(p) {
+			break
 		}
+	}
+	if n > 0 {
+		return
 	}
 	if c.directRead {
 		return c.netConn.Read(p)
@@ -137,9 +141,6 @@ func (c *VisionConn) Read(p []byte) (n int, err error) {
 	if c.withinPaddingBuffers || c.numberOfPacketToFilter > 0 {
 		buffers := c.unPadding(bufferBytes)
 		if chunkBuffer != nil {
-			buffers = common.Map(buffers, func(it *buf.Buffer) *buf.Buffer {
-				return it.ToOwned()
-			})
 			chunkBuffer.Reset()
 		}
 		if c.remainingContent == 0 && c.remainingPadding == 0 {
@@ -178,15 +179,16 @@ func (c *VisionConn) Read(p []byte) (n int, err error) {
 		if c.numberOfPacketToFilter > 0 {
 			c.filterTLS(buf.ToSliceMulti(buffers))
 		}
-		c.remainingReader = io.MultiReader(common.Map(buffers, func(it *buf.Buffer) io.Reader { return it })...)
+		c.remainingBuffers = buffers
 		return c.Read(p)
 	} else {
 		if c.numberOfPacketToFilter > 0 {
 			c.filterTLS([][]byte{bufferBytes})
 		}
 		if chunkBuffer != nil {
-			n = copy(p, bufferBytes)
-			chunkBuffer.Advance(n)
+			c.remainingBuffers = append(c.remainingBuffers, buf.As(chunkBuffer.Bytes()))
+			chunkBuffer.Reset() // chunkBuffer should not be release and only reused after c.remainingBuffers be emptied, so must reset at here
+			return c.Read(p)
 		}
 		return
 	}
@@ -344,13 +346,13 @@ func (c *VisionConn) unPadding(buffer []byte) []*buf.Buffer {
 		}
 	}
 	if c.remainingContent == -1 && c.remainingPadding == -1 {
-		return []*buf.Buffer{buf.As(buffer)}
+		return []*buf.Buffer{buf.As(buffer).ToOwned()}
 	}
 	var buffers []*buf.Buffer
 	for bufferIndex < len(buffer) {
 		if c.remainingContent <= 0 && c.remainingPadding <= 0 {
 			if c.currentCommand == 1 {
-				buffers = append(buffers, buf.As(buffer[bufferIndex:]))
+				buffers = append(buffers, buf.As(buffer[bufferIndex:]).ToOwned())
 				break
 			} else {
 				paddingInfo := buffer[bufferIndex : bufferIndex+5]
@@ -365,7 +367,7 @@ func (c *VisionConn) unPadding(buffer []byte) []*buf.Buffer {
 			if end > len(buffer)-bufferIndex {
 				end = len(buffer) - bufferIndex
 			}
-			buffers = append(buffers, buf.As(buffer[bufferIndex:bufferIndex+end]))
+			buffers = append(buffers, buf.As(buffer[bufferIndex:bufferIndex+end]).ToOwned())
 			c.remainingContent -= end
 			bufferIndex += end
 		} else {
